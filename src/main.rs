@@ -5,13 +5,13 @@ use lazy_static::lazy_static;
 use log::{debug, error, info, trace};
 use prql_compiler::{ErrorMessage, ErrorMessages, Options, Target};
 use std::io::{Cursor, Seek};
+use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 // TODOs
 // query bigger than 1024?
-// return PRQL error to client without hitting the server.
 
 #[derive(Parser, Debug)]
 #[command(author="JP Moresmau", version, about="A TCP proxy that can translate PRQL to Postgres SQL", long_about = None)]
@@ -24,6 +24,9 @@ struct Args {
     #[arg(short, long)]
     address: String,
 }
+
+/// Ready for query message.
+const READY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
 
 lazy_static! {
     static ref OPTIONS: Options = Options::default()
@@ -44,16 +47,16 @@ async fn main() -> io::Result<()> {
         let server = TcpStream::connect(&args.server).await?;
         info!("Connected to {}", args.server);
 
-        let (mut client_r, mut client_w) = client.into_split();
+        let (mut client_r, client_w) = client.into_split();
         let (mut server_r, mut server_w) = server.into_split();
 
-        let (tx, mut rx) = mpsc::channel(100);
-        let tx2 = tx.clone();
+        let client_w1 = Arc::new(Mutex::new(client_w));
+        let client_w2 = Arc::clone(&client_w1);
 
         tokio::spawn(async move {
             let mut buf = vec![0; 4096];
             client_r.readable().await.unwrap();
-            let mut state = State::SSL;
+            let mut state = State::Ssl;
             loop {
                 match client_r.read(&mut buf).await {
                     Ok(0) => return,
@@ -64,7 +67,7 @@ async fn main() -> io::Result<()> {
                                 for msg in msgs.inner {
                                     match prql_error_message(&msg).await {
                                         Ok(dt) => {
-                                            match tx.send(dt).await {
+                                            match client_w2.lock().await.write_all(&dt).await {
                                                 Ok(_) => {}
                                                 Err(err) => error!("Error queuing to client {err}"),
                                             }
@@ -72,14 +75,10 @@ async fn main() -> io::Result<()> {
                                         Err(err) => error!("Error generating error message: {err}"),
                                     }
                                 }
-                                match ready_for_query().await {
-                                    Ok(dt) => match tx.send(dt).await
-                                    {
-                                        Ok(_) => {}
-                                        Err(err) => error!("Error queuing to client {err}"),
-                                    },
-                                    Err(err) => error!("Error generating ready message: {err}"),
-                                }
+                                match client_w2.lock().await.write_all(&READY).await {
+                                    Ok(_) => {}
+                                    Err(err) => error!("Error queuing to client {err}"),
+                                };
                             }
                             Ok((new_state, new_count, _)) => {
                                 state = new_state;
@@ -90,7 +89,6 @@ async fn main() -> io::Result<()> {
                             }
                             Err(err) => error!("Error processing client request: {err}"),
                         }
-                       
                     }
                     Err(err) => {
                         error!("Error reading from client {err}");
@@ -123,7 +121,7 @@ async fn main() -> io::Result<()> {
                                 debug!("field: {field_name} ({dt})");
                             }
                         }*/
-                        match tx2.send(buf[0..count].into()).await {
+                        match client_w1.lock().await.write_all(&buf[0..count]).await {
                             Ok(_) => {}
                             Err(err) => error!("Error queuing to client {err}"),
                         }
@@ -135,18 +133,10 @@ async fn main() -> io::Result<()> {
                 }
             }
         });
-
-        tokio::spawn(async move {
-            while let Some(i) = rx.recv().await {
-                match client_w.write_all(&i).await {
-                    Ok(_) => {}
-                    Err(err) => error!("Error writing to client {err}"),
-                }
-            }
-        });
     }
 }
 
+/// Intercept the client message, if it looks like a PRQL query rewrite it as SQL.
 async fn intercept_client(
     state: &State,
     mut buf: &mut Vec<u8>,
@@ -155,7 +145,7 @@ async fn intercept_client(
     let mut c = Cursor::new(&buf[..count]);
     match state {
         // First message is SSL negotiation, we don't support that for now.
-        State::SSL => {
+        State::Ssl => {
             let sz = ReadBytesExt::read_u32::<BigEndian>(&mut c)?;
             let protocol = ReadBytesExt::read_i32::<BigEndian>(&mut c)?;
             trace!("ssl {sz} {protocol}");
@@ -190,7 +180,7 @@ async fn intercept_client(
                 debug!("query: {s1}");
                 // PRQL query, as recognized by the prefix.
                 if let Some(prql) = s1.strip_prefix("prql:") {
-                    let prql = prql.trim().trim_end_matches(";");
+                    let prql = prql.trim().trim_end_matches(';');
                     match prql_compiler::compile(prql, &OPTIONS) {
                         Ok(sql) => {
                             debug!("prql transformed to {sql}");
@@ -201,7 +191,7 @@ async fn intercept_client(
                             // Query size + initial message size (4) + final semi colon + final zero.
                             WriteBytesExt::write_u32::<BigEndian>(&mut buf, (bs.len() + 6) as u32)?;
                             count = buf.write(bs).await?;
-                            WriteBytesExt::write_u8(&mut buf, ';' as u8)?;
+                            WriteBytesExt::write_u8(&mut buf, b';')?;
                             WriteBytesExt::write_u8(&mut buf, 0)?;
                             // Full message size + operation flag.
                             count += 7;
@@ -218,18 +208,11 @@ async fn intercept_client(
     }
 }
 
-async fn ready_for_query() -> Result<Vec<u8>>{
-    let mut buf = Vec::with_capacity(6);
-    WriteBytesExt::write_u8(&mut buf, 'Z' as u8)?;
-    WriteBytesExt::write_u32::<BigEndian>(&mut buf, 5)?;
-    WriteBytesExt::write_u8(&mut buf, 'I' as u8)?;
-    Ok(buf)
-}
-
+/// Generate a Postgres error message for a PRQL error.
 async fn prql_error_message(msg: &ErrorMessage) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(100);
     let mut c = Cursor::new(&mut buf);
-    WriteBytesExt::write_u8(&mut c, 'E' as u8)?;
+    WriteBytesExt::write_u8(&mut c, b'E')?;
     let mut sz = 5_u32;
     WriteBytesExt::write_u32::<BigEndian>(&mut c, sz)?;
     sz += write_field(&mut c, 'S', "ERROR").await?;
@@ -255,10 +238,10 @@ async fn prql_error_message(msg: &ErrorMessage) -> Result<Vec<u8>> {
     // Set proper size.
     c.seek(io::SeekFrom::Start(1))?;
     WriteBytesExt::write_u32::<BigEndian>(&mut c, sz)?;
-    eprintln!("{} {buf:?}", buf.len());
     Ok(buf)
 }
 
+/// Write a single error field with the given code and value.
 async fn write_field(c: &mut Cursor<&mut Vec<u8>>, code: char, value: &str) -> Result<u32> {
     WriteBytesExt::write_u8(c, code as u8)?;
     let mut sz = 2;
@@ -283,8 +266,10 @@ where
     Ok((s, sz))
 }
 
+// Communication state between client and server.
+#[derive(Debug)]
 enum State {
-    SSL,
+    Ssl,
     Start,
     Content,
 }
