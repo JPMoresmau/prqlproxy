@@ -521,6 +521,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prqlproxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "clap",
+ "env_logger",
+ "lazy_static",
+ "log",
+ "prql-compiler",
+ "tokio",
+]
+
+[[package]]
 name = "psm"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -669,20 +683,6 @@ checksum = "355dc4d4b6207ca8a3434fc587db0a8016130a574dbcdbfb93d7f7b5bc5b211a"
 dependencies = [
  "log",
  "serde",
-]
-
-[[package]]
-name = "sqlproxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "byteorder",
- "clap",
- "env_logger",
- "lazy_static",
- "log",
- "prql-compiler",
- "tokio",
 ]
 
 [[package]]

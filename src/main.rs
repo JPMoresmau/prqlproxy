@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use clap::Parser;
 use lazy_static::lazy_static;
@@ -7,14 +7,12 @@ use prql_compiler::{ErrorMessage, ErrorMessages, Options, Target};
 use std::io::{Cursor, Seek};
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-// TODOs
-// query bigger than 1024?
-
 #[derive(Parser, Debug)]
-#[command(author="JP Moresmau", version, about="A TCP proxy that can translate PRQL to Postgres SQL", long_about = None)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     /// Address:port of the PostgreSQL database server to proxy.
     #[arg(short, long)]
@@ -62,7 +60,7 @@ async fn main() -> io::Result<()> {
                     Ok(0) => return,
                     Ok(count) => {
                         trace!("read {count} bytes from client");
-                        match intercept_client(&state, &mut buf, count).await {
+                        match intercept_client(&mut client_r, &state, &mut buf, count).await {
                             Ok((_, _, Some(msgs))) => {
                                 for msg in msgs.inner {
                                     match prql_error_message(&msg).await {
@@ -103,29 +101,10 @@ async fn main() -> io::Result<()> {
             loop {
                 match server_r.read(&mut buf).await {
                     Ok(0) => return,
-                    Ok(count) => {
-                        /*let mut c = Cursor::new(&buf[..count]);
-                        let op = ReadBytesExt::read_u8(&mut c).unwrap() as char;
-                        trace!("server operation {op}");
-                        if op == 'T'{
-                            let mut _sz = ReadBytesExt::read_i32::<BigEndian>(&mut c).unwrap();
-                            let fs = ReadBytesExt::read_i16::<BigEndian>(&mut c).unwrap();
-                            for _ in 0..fs {
-                                let (field_name,_) = read_string(&mut c);
-                                let _tbl = ReadBytesExt::read_i32::<BigEndian>(&mut c).unwrap();
-                                let _col = ReadBytesExt::read_i16::<BigEndian>(&mut c).unwrap();
-                                let dt = ReadBytesExt::read_i32::<BigEndian>(&mut c).unwrap();
-                                let _dtsz = ReadBytesExt::read_i16::<BigEndian>(&mut c).unwrap();
-                                let _mod = ReadBytesExt::read_i32::<BigEndian>(&mut c).unwrap();
-                                let _fmt = ReadBytesExt::read_i16::<BigEndian>(&mut c).unwrap();
-                                debug!("field: {field_name} ({dt})");
-                            }
-                        }*/
-                        match client_w1.lock().await.write_all(&buf[0..count]).await {
-                            Ok(_) => {}
-                            Err(err) => error!("Error queuing to client {err}"),
-                        }
-                    }
+                    Ok(count) => match client_w1.lock().await.write_all(&buf[0..count]).await {
+                        Ok(_) => {}
+                        Err(err) => error!("Error queuing to client {err}"),
+                    },
                     Err(err) => {
                         error!("Error reading from server {err}");
                         return;
@@ -138,8 +117,9 @@ async fn main() -> io::Result<()> {
 
 /// Intercept the client message, if it looks like a PRQL query rewrite it as SQL.
 async fn intercept_client(
+    client_r: &mut OwnedReadHalf,
     state: &State,
-    mut buf: &mut Vec<u8>,
+    buf: &mut Vec<u8>,
     mut count: usize,
 ) -> Result<(State, usize, Option<ErrorMessages>)> {
     let mut c = Cursor::new(&buf[..count]);
@@ -175,8 +155,35 @@ async fn intercept_client(
             let mut msgs = None;
             // Query.
             if op == 'Q' {
-                let _sz = ReadBytesExt::read_i32::<BigEndian>(&mut c)?;
-                let (s1, _r) = read_string(&mut c)?;
+                let sz = ReadBytesExt::read_i32::<BigEndian>(&mut c)?;
+                let target = sz as usize + 1;
+                let (s1, _r) = if count < target {
+                    // Query longer than buffer, keep reading to get the proper full size.
+                    let mut full_buf = Vec::with_capacity(sz as usize - 4);
+                    let mut query_c: Cursor<&mut Vec<u8>> = Cursor::new(&mut full_buf);
+                    query_c.write(&buf[0..count]).await?;
+                    while count < target {
+                        let mut query_buf = vec![0; 4096];
+                        match client_r.read(&mut query_buf).await {
+                            Ok(0) => {
+                                return Err(anyhow!("Client closed while reading query"));
+                            }
+                            Ok(n) => {
+                                count += n;
+                                query_c.write(&query_buf[0..n]).await?;
+                            }
+                            Err(err) => {
+                                return Err(anyhow!(
+                                    "Error reading rest of query from client {err}"
+                                ));
+                            }
+                        }
+                    }
+                    query_c.set_position(c.position());
+                    read_string(&mut query_c)?
+                } else {
+                    read_string(&mut c)?
+                };
                 debug!("query: {s1}");
                 // PRQL query, as recognized by the prefix.
                 if let Some(prql) = s1.strip_prefix("prql:") {
@@ -185,14 +192,14 @@ async fn intercept_client(
                         Ok(sql) => {
                             debug!("prql transformed to {sql}");
                             let bs = sql.as_bytes();
-                            buf.clear();
+                            let mut c = Cursor::new(buf);
                             // Same Query operation.
-                            WriteBytesExt::write_u8(&mut buf, op as u8)?;
+                            WriteBytesExt::write_u8(&mut c, op as u8)?;
                             // Query size + initial message size (4) + final semi colon + final zero.
-                            WriteBytesExt::write_u32::<BigEndian>(&mut buf, (bs.len() + 6) as u32)?;
-                            count = buf.write(bs).await?;
-                            WriteBytesExt::write_u8(&mut buf, b';')?;
-                            WriteBytesExt::write_u8(&mut buf, 0)?;
+                            WriteBytesExt::write_u32::<BigEndian>(&mut c, (bs.len() + 6) as u32)?;
+                            count = c.write(bs).await?;
+                            WriteBytesExt::write_u8(&mut c, b';')?;
+                            WriteBytesExt::write_u8(&mut c, 0)?;
                             // Full message size + operation flag.
                             count += 7;
                         }
