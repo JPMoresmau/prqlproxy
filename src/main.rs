@@ -161,7 +161,7 @@ async fn intercept_client(
                     // Query longer than buffer, keep reading to get the proper full size.
                     let mut full_buf = Vec::with_capacity(sz as usize - 4);
                     let mut query_c: Cursor<&mut Vec<u8>> = Cursor::new(&mut full_buf);
-                    query_c.write(&buf[0..count]).await?;
+                    query_c.write_all(&buf[0..count]).await?;
                     while count < target {
                         let mut query_buf = vec![0; 4096];
                         match client_r.read(&mut query_buf).await {
@@ -170,7 +170,7 @@ async fn intercept_client(
                             }
                             Ok(n) => {
                                 count += n;
-                                query_c.write(&query_buf[0..n]).await?;
+                                query_c.write_all(&query_buf[0..n]).await?;
                             }
                             Err(err) => {
                                 return Err(anyhow!(
