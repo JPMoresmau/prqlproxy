@@ -150,38 +150,13 @@ async fn intercept_client(
             let mut msgs = None;
             // Query.
             if op == 'Q' {
-                let sz = ReadBytesExt::read_i32::<BigEndian>(&mut c)?;
-                let target = sz as usize + 1;
-                let (s1, _r) = if count < target {
-                    // Query longer than buffer, keep reading to get the proper full size.
-                    let mut full_buf = Vec::with_capacity(sz as usize - 4);
-                    let mut query_c: Cursor<&mut Vec<u8>> = Cursor::new(&mut full_buf);
-                    query_c.write_all(&buf[0..count]).await?;
-                    while count < target {
-                        let mut query_buf = vec![0; 4096];
-                        match client_r.read(&mut query_buf).await {
-                            Ok(0) => {
-                                return Err(anyhow!("Client closed while reading query"));
-                            }
-                            Ok(n) => {
-                                count += n;
-                                query_c.write_all(&query_buf[0..n]).await?;
-                            }
-                            Err(err) => {
-                                return Err(anyhow!(
-                                    "Error reading rest of query from client {err}"
-                                ));
-                            }
-                        }
-                    }
-                    query_c.set_position(c.position());
-                    read_string(&mut query_c)?
-                } else {
-                    read_string(&mut c)?
-                };
-                debug!("query: {s1}");
+                let _sz = ReadBytesExt::read_i32::<BigEndian>(&mut c)?;
+                //let target = sz as usize + 1;
+
+                let (query, _r) = read_string(&mut c)?; //read_query_string(client_r, count, target, sz as usize - 4, &mut c).await?;
+                debug!("simple query: {query}");
                 // PRQL query, as recognized by the prefix.
-                if let Some(prql) = s1.strip_prefix("prql:") {
+                if let Some(prql) = query.strip_prefix("prql:") {
                     let prql = prql.trim().trim_end_matches(';');
                     match prql_compiler::compile(prql, &OPTIONS) {
                         Ok(sql) => {
@@ -190,7 +165,7 @@ async fn intercept_client(
                             let mut c = Cursor::new(buf);
                             // Same Query operation.
                             WriteBytesExt::write_u8(&mut c, op as u8)?;
-                            // Query size + initial message size (4) + final semi colon + final zero.
+                            // Initial message size (4) + query size + final semi colon + final zero.
                             WriteBytesExt::write_u32::<BigEndian>(&mut c, (bs.len() + 6) as u32)?;
                             count = c.write(bs).await?;
                             WriteBytesExt::write_u8(&mut c, b';')?;
@@ -204,9 +179,88 @@ async fn intercept_client(
                         }
                     };
                 }
+            // Parse prepared statement.
+            } else if op == 'P' {
+                let sz = ReadBytesExt::read_u32::<BigEndian>(&mut c)? as usize;
+                let (statement, _sz2) = read_string(&mut c)?;
+                let (query, _sz3) = read_string(&mut c)?;
+                debug!("simple query: {query}");
+                // PRQL query, as recognized by the prefix.
+                if let Some(prql) = query.strip_prefix("prql:") {
+                    let prql = prql.trim().trim_end_matches(';');
+
+                    let fld_nb = ReadBytesExt::read_u16::<BigEndian>(&mut c)? as usize;
+                    let mut flds = Vec::with_capacity(fld_nb);
+                    for _ in 0..fld_nb {
+                        flds.push(ReadBytesExt::read_u32::<BigEndian>(&mut c)?);
+                    }
+                    let extra = Vec::from(&buf[sz+1..count]);
+                    
+                    match prql_compiler::compile(prql, &OPTIONS) {
+                        Ok(sql) => {
+                            debug!("prql transformed to {sql}");
+                            let bs = sql.as_bytes();
+                            let sbs = statement.as_bytes();
+                            // Operation + Initial message size (4) + sz2 (includes zero) + query + final semi colon + final zero + field count (2) + field types.
+                            count = bs.len() + sbs.len() + 10 + (fld_nb * 4) + extra.len();
+                            let mut c = Cursor::new(buf);
+                            // Same Parse operation.
+                            WriteBytesExt::write_u8(&mut c, b'P')?;
+                            WriteBytesExt::write_u32::<BigEndian>(&mut c, (count - 1 - extra.len()) as u32)?;
+                            c.write(sbs).await?;
+                            WriteBytesExt::write_u8(&mut c, 0)?;
+                            c.write(bs).await?;
+                            WriteBytesExt::write_u8(&mut c, b';')?;
+                            WriteBytesExt::write_u8(&mut c, 0)?;
+                            WriteBytesExt::write_u16::<BigEndian>(&mut c, fld_nb as u16)?;
+                            for f in flds {
+                                WriteBytesExt::write_u32::<BigEndian>(&mut c, f)?;
+                            }
+                            c.write(&extra).await?;
+                        }
+                        Err(err) => {
+                            error!("prql error: {err}");
+                            msgs = Some(err);
+                        }
+                    };
+                }
             }
             Ok((State::Content, count, msgs))
         }
+    }
+}
+
+async fn read_query_string(
+    client_r: &mut OwnedReadHalf,
+    mut count: usize,
+    target: usize,
+    sz: usize,
+    c: &mut Cursor<&[u8]>,
+) -> Result<(String, usize)> {
+    if count < target {
+        // Query longer than buffer, keep reading to get the proper full size.
+        let mut full_buf = Vec::with_capacity(sz);
+        let mut query_c: Cursor<&mut Vec<u8>> = Cursor::new(&mut full_buf);
+        query_c.write_all(&c.get_ref()[0..count]).await?;
+        while count < target {
+            let mut query_buf = vec![0; 4096];
+            match client_r.read(&mut query_buf).await {
+                Ok(0) => {
+                    return Err(anyhow!("Client closed while reading query"));
+                }
+                Ok(n) => {
+                    count += n;
+                    query_c.write_all(&query_buf[0..n]).await?;
+                }
+                Err(err) => {
+                    return Err(anyhow!("Error reading rest of query from client {err}"));
+                }
+            }
+        }
+        query_c.set_position(c.position());
+        read_string(&mut query_c)
+    } else {
+        read_string(c)
     }
 }
 

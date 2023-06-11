@@ -39,7 +39,23 @@ lazy_static! {
 }
 
 #[test]
-fn test_sql_query() -> Result<()> {
+fn test_simple_sql_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        let rows = test_client()
+            .await?
+            .simple_query("select count(*) from customer")
+            .await?;
+        if let Some(SimpleQueryMessage::Row(r)) = rows.get(0) {
+            assert_eq!("599", r.get(0).unwrap());
+        } else {
+            panic!("no row");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn test_extended_sql_query() -> Result<()> {
     RUNTIME.as_ref().unwrap().block_on(async {
         let row = test_client()
             .await?
@@ -51,17 +67,45 @@ fn test_sql_query() -> Result<()> {
 }
 
 #[test]
-fn test_prql_query() -> Result<()> {
+fn test_simple_prql_query() -> Result<()> {
     RUNTIME.as_ref().unwrap().block_on(async {
-        let row = test_client()
+        let rows = test_client()
             .await?
             .simple_query("prql: from customer\naggregate [ct = count]")
             .await?;
-        if let Some(SimpleQueryMessage::Row(r)) = row.get(0) {
+        if let Some(SimpleQueryMessage::Row(r)) = rows.get(0) {
             assert_eq!("599", r.get(0).unwrap());
         } else {
             panic!("no row");
         }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_simple_prql_query_syntax_error() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        let r = test_client()
+            .await?
+            .simple_query("prql: wrong")
+            .await;
+        assert!(r.is_err());
+        if let Err(err) = r {
+            assert!(err.to_string().contains("ERROR: Unknown name wrong"));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn test_extended_prql_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        let row = test_client()
+            .await?
+            .query_one("prql: from customer\naggregate [ct = count]", &[])
+            .await?;
+        assert_eq!(599, row.get::<usize, i64>(0));
 
         Ok(())
     })
