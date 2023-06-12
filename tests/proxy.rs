@@ -55,6 +55,25 @@ fn test_simple_sql_query() -> Result<()> {
 }
 
 #[test]
+fn test_simple_sql_long_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        for l in [10, 1000, 10000]{
+            let s = "a".repeat(l);
+            let rows = test_client()
+                .await?
+                .simple_query(&format!("select '{s}'"))
+                .await?;
+            if let Some(SimpleQueryMessage::Row(r)) = rows.get(0) {
+                assert_eq!(s, r.get(0).unwrap());
+            } else {
+                panic!("no row");
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn test_extended_sql_query() -> Result<()> {
     RUNTIME.as_ref().unwrap().block_on(async {
         let row = test_client()
@@ -67,11 +86,26 @@ fn test_extended_sql_query() -> Result<()> {
 }
 
 #[test]
+fn test_extended_sql_long_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        for l in [10, 1000, 10000]{
+            let s = "a".repeat(l);
+            let row = test_client()
+                .await?
+                .query_one(&format!("select '{s}'"),&[])
+                .await?;
+            assert_eq!(s, row.get::<usize, String>(0));
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn test_simple_prql_query() -> Result<()> {
     RUNTIME.as_ref().unwrap().block_on(async {
         let rows = test_client()
             .await?
-            .simple_query("prql: from customer\naggregate [ct = count]")
+            .simple_query("prql: from customer | aggregate [ct = count]")
             .await?;
         if let Some(SimpleQueryMessage::Row(r)) = rows.get(0) {
             assert_eq!("599", r.get(0).unwrap());
@@ -99,14 +133,49 @@ fn test_simple_prql_query_syntax_error() -> Result<()> {
 }
 
 #[test]
+fn test_simple_prql_long_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        for l in [10, 1000, 10000]{
+            let s = "a".repeat(l);
+            let rows = test_client()
+                .await?
+                .simple_query(&format!("prql: from customer | select '{s}' | take 1"))
+                .await?;
+            if let Some(SimpleQueryMessage::Row(r)) = rows.get(0) {
+                assert_eq!(s, r.get(0).unwrap());
+            } else {
+                panic!("no row");
+            }
+        }
+        Ok(())
+    })
+}
+
+
+#[test]
 fn test_extended_prql_query() -> Result<()> {
     RUNTIME.as_ref().unwrap().block_on(async {
         let row = test_client()
             .await?
-            .query_one("prql: from customer\naggregate [ct = count]", &[])
+            .query_one("prql: from customer | aggregate [ct = count]", &[])
             .await?;
         assert_eq!(599, row.get::<usize, i64>(0));
 
+        Ok(())
+    })
+}
+
+#[test]
+fn test_extended_prql_long_query() -> Result<()> {
+    RUNTIME.as_ref().unwrap().block_on(async {
+        for l in [10, 1000, 10000]{
+            let s = "a".repeat(l);
+            let row = test_client()
+                .await?
+                .query_one(&format!("prql: from customer | select '{s}' | take 1"),&[])
+                .await?;
+            assert_eq!(s, row.get::<usize, String>(0));
+        }
         Ok(())
     })
 }
